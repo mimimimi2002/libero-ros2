@@ -1,0 +1,13 @@
+{
+  "hsv": {
+    "ball_low": [5, 150, 150],
+    "ball_high": [25, 255, 255],
+    "box_low": [100, 120, 100],
+    "box_high": [130, 255, 255]
+  },
+  "detection": {
+    "ball_min_area": 80,
+    "box_min_area": 400
+  },
+  "box_center_offset_z": 0.02
+}

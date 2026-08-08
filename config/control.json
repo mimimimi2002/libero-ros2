@@ -1,0 +1,17 @@
+{
+  "tcp_offset_xy": [0.0, 0.0],
+  "place_z": 1.05,
+  "hover_clearance": 0.15,
+  "lift_clearance": 0.22,
+  "xy_tol": 0.012,
+  "z_tol": 0.012,
+  "place_xy_tol": 0.020,
+  "stable_need": 8,
+  "kp": 2.5,
+  "v_max_far": 0.15,
+  "v_max_near": 0.06,
+  "near_dist": 0.04,
+  "control_period": 0.05,
+  "grasp_hold_steps": 30,
+  "release_hold_steps": 20
+}
