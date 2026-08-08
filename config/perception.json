@@ -9,5 +9,8 @@
     "ball_min_area": 80,
     "box_min_area": 400
   },
-  "box_center_offset_z": 0.02
+  "box_center_offset_z": 0.02,
+  "debug": {
+    "match_thresh_xy": 0.12
+  }
 }
