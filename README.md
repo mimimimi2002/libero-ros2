@@ -1,82 +1,81 @@
 # Vision-based Pick & Place on ROS 2 + robosuite
 
-**単眼カメラ画像だけ**を使い、机上の球 3 個を検出して箱へ片付ける pick & place を、ROS 2 の複数ノード構成で動かします。
+Using **monocular camera images only**, this demo detects 3 balls on a table and tidies them into a box via pick & place, running as a multi-node ROS 2 system.
 
 ```
-画像 → HSV 検出 + 机平面との交差で 3D 化 → 状態機械で pick & place
+image → HSV detection + intersection with the table plane for 3D → FSM for pick & place
 ```
 
-シミュレータの真値（GT）は**制御には使いません**。知覚と制御の分離を、実機に近い形で示しています。
+The simulator's ground truth (GT) is **never used for control**. The separation of perception and control is demonstrated in a form close to a real robot setup.
 
 ---
 
 ## Index
 
-1. [デモ](#デモ)
-2. [概要](#概要)
-3. [設計上のポイント](#設計上のポイント)
-4. [アーキテクチャ](#アーキテクチャ)
-5. [処理の流れ](#処理の流れ)
-6. [設定（`config/`）](#設定config)
-7. [起動方法](#起動方法)
-8. [技術スタック](#技術スタック)
+1. [Demo](#demo)
+2. [Overview](#overview)
+3. [Design Highlights](#design-highlights)
+4. [Architecture](#architecture)
+5. [How It Works](#how-it-works)
+6. [Configuration (`config/`)](#configuration-config)
+7. [Running the Demo](#running-the-demo)
+8. [Tech Stack](#tech-stack)
 
 ---
 
-## デモ
-
+## Demo
 https://github.com/user-attachments/assets/3203123b-01db-4fe1-a728-46dfe3c75d12
 
 ---
 
-## 概要
+## Overview
 
-| 項目 | 内容 |
+| Item | Description |
 |---|---|
-| タスク | 机上のオレンジ球 3 個を青い箱へ収納 |
-| センサ | 単眼 RGB（agentview、深度なし） |
-| ロボット | Panda + OSC_POSE（robosuite / MuJoCo） |
-| ソフト構成 | ROS 2 Humble、ノード 3（+ 任意の誤差評価） |
-| 制御入力 | 知覚推定 `/percept/*` のみ（GT はデバッグ専用） |
-| パラメータ | `config/*.json` に集約（コード変更なしで調整可能） |
+| Task | Put 3 orange balls on the table into a blue box |
+| Sensor | Monocular RGB (agentview, no depth) |
+| Robot | Panda + OSC_POSE (robosuite / MuJoCo) |
+| Software | ROS 2 Humble, 3 nodes (+ optional error evaluation) |
+| Control input | Perception estimates `/percept/*` only (GT is for debugging only) |
+| Parameters | Consolidated in `config/*.json` (tunable without code changes) |
 
-リポジトリ名に LIBERO が含まれますが、本デモは robosuite 上の自作 tidy-up 環境です。
-
----
-
-## 設計上のポイント
-
-1. **実機を想定したノード分割**  
-   シミュレーション境界 / 知覚 / タスク制御を別プロセスにし、トピックで接続。シミュレータ内部の便利な真値に依存しない構成にしています。
-
-2. **知覚と真値のトピック分離**  
-   - 制御: `/percept/ball_poses`, `/percept/box_pose`  
-   - 評価のみ: `/gt/*`  
-   これにより「視覚で動かす」ことと「誤差を測る」ことを同時にできます。
-
-3. **単眼 → 3D の前提を明示**  
-   深度がないため、既知の机高さ平面とのレイ交差で (u, v) を 3D 化。球半径などの前提は `config/env.json` と共有し、ずれの影響を追いやすくしています。
-
-4. **軸分離の状態機械**  
-   XY 移動と Z 移動を混ぜず、把持・解放は並進ゼロ＋グリッパ指令のみ。オーバーシュートによる誤遷移を抑えるため、許容誤差内の連続到達でステップを進めます。
-
-5. **設定の外部化**  
-   シーン・HSV・制御ゲインを JSON に分離。再現実験やチューニングをコードと切り離しています。
+The repository name contains "LIBERO", but this demo is a custom tidy-up environment built on robosuite.
 
 ---
 
-## アーキテクチャ
+## Design Highlights
 
-データは基本的に一方向。ロボット指令だけが Bridge に戻ります。
+1. **Node split assuming a real robot**
+   Simulation boundary / perception / task control run as separate processes, connected via topics. The design avoids relying on convenient ground truth available inside the simulator.
+
+2. **Separate topics for perception and ground truth**
+   - Control: `/percept/ball_poses`, `/percept/box_pose`
+   - Evaluation only: `/gt/*`
+   This makes it possible to "drive with vision" and "measure the error" at the same time.
+
+3. **Explicit assumptions for monocular → 3D**
+   With no depth available, (u, v) is lifted to 3D by intersecting a camera ray with a horizontal plane at a known table height. Assumptions such as the ball radius are shared with `config/env.json`, making the impact of any mismatch easy to trace.
+
+4. **Axis-decoupled state machine**
+   XY and Z motions are never mixed; grasp and release use zero translation plus a gripper command only. To suppress false transitions caused by overshoot, a step advances only after the target is reached within tolerance for consecutive cycles.
+
+5. **Externalized configuration**
+   Scene, HSV, and control gains live in JSON. Reproducing experiments and tuning are decoupled from the code.
+
+---
+
+## Architecture
+
+Data flows in essentially one direction; only robot commands travel back to the Bridge.
 
 ```mermaid
 flowchart TD
     SIM["MuJoCo / robosuite<br/>CustomTidyUpEnv"]
 
-    BR["<b>robosuite_bridge_node</b><br/>sim 境界・40 Hz"]
+    BR["<b>robosuite_bridge_node</b><br/>sim boundary · 40 Hz"]
     HSV["<b>hsv_perceptor_node</b><br/>HSV → 3D"]
-    TM["<b>task_manager_node</b><br/>FSM・40 Hz"]
-    DBG["percept_error_debug_node<br/><i>任意・誤差評価</i>"]
+    TM["<b>task_manager_node</b><br/>FSM · 40 Hz"]
+    DBG["percept_error_debug_node<br/><i>optional · error evaluation</i>"]
 
     SIM <-->|"step / obs"| BR
     BR -->|"image / K / extrinsic / table_z"| HSV
@@ -92,90 +91,90 @@ flowchart TD
     class DBG opt
 ```
 
-### 主要ファイル
+### Key files
 
-| ファイル | 役割 |
+| File | Role |
 |---|---|
-| `robosuite_bridge_node.py` | 唯一 robosuite に触れる境界。観測配信・アクション適用 |
-| `hsv_perceptor_node.py` | 色検出と机平面交差による 3D 推定 |
-| `task_manager_node.py` | pick & place の状態機械 |
-| `percept_error_debug_node.py` | `/percept` と `/gt` の誤差（任意） |
-| `config_loader.py` / `config/` | 環境・知覚・制御パラメータ |
+| `robosuite_bridge_node.py` | The only boundary that touches robosuite. Publishes observations, applies actions |
+| `hsv_perceptor_node.py` | Color detection and 3D estimation via table-plane intersection |
+| `task_manager_node.py` | Pick & place state machine |
+| `percept_error_debug_node.py` | Error between `/percept` and `/gt` (optional) |
+| `config_loader.py` / `config/` | Environment, perception, and control parameters |
 
-### 主要トピック（制御経路）
+### Key topics (control path)
 
-| トピック | 方向 | 内容 |
+| Topic | Direction | Contents |
 |---|---|---|
-| `/camera/image_raw` ほか | Bridge → HSV | 画像・内部・外部パラメータ・机高さ |
-| `/percept/ball_poses`, `/percept/box_pose` | HSV → Task Manager | 推定位置 |
-| `/robot/eef_pose` | Bridge → Task Manager | 手先位置 |
-| `/robot/cmd_action` | Task Manager → Bridge | OSC 7 次元（並進 + グリッパ） |
+| `/camera/image_raw` and others | Bridge → HSV | Image, intrinsics, extrinsics, table height |
+| `/percept/ball_poses`, `/percept/box_pose` | HSV → Task Manager | Estimated positions |
+| `/robot/eef_pose` | Bridge → Task Manager | End-effector position |
+| `/robot/cmd_action` | Task Manager → Bridge | 7-dimensional OSC (translation + gripper) |
 
-真値 `/gt/*` と誤差 `/debug/*` は評価用で、制御ループには入りません。
+Ground truth `/gt/*` and errors `/debug/*` are for evaluation and never enter the control loop.
 
 ---
 
-## 処理の流れ
+## How It Works
 
-### 知覚
+### Perception
 
-1. HSV で球（オレンジ）・箱（青）をマスク  
-2. 輪郭の重心 (u, v) を取得  
-3. カメラからレイを飛ばし、既知高さの水平面と交差させて 3D 化  
-   - 球: `table_height + ball_radius`  
-   - 箱: `table_height + box_center_offset_z`
+1. Mask the balls (orange) and the box (blue) in HSV
+2. Take the centroid (u, v) of each contour
+3. Cast a ray from the camera and intersect it with a horizontal plane at a known height to get 3D
+   - Balls: `table_height + ball_radius`
+   - Box: `table_height + box_center_offset_z`
 
-### 制御（軸分離 FSM）
+### Control (axis-decoupled FSM)
 
-検出開始後、球位置と箱位置をラッチし、各球について次を繰り返します（移動高さは共通の `travel_z`）。
+Once detection starts, the ball and box positions are latched, and the following is repeated for each ball (the travel height is the shared `travel_z`).
 
 ```
 0  Z → travel_z
-1  XY → 球の真上（高さ固定）
-2  Z → 球中心
-3  grasp（グリッパ閉・並進ゼロ）
+1  XY → directly above the ball (height fixed)
+2  Z → ball center
+3  grasp (close gripper, zero translation)
 4  Z → travel_z
-5  XY → 箱の真上
-6  release（グリッパ開・並進ゼロ）→ 次の球
+5  XY → directly above the box
+6  release (open gripper, zero translation) → next ball
 ```
 
-OSC 指令は正規化 `[-1, 1]`。P ゲインと距離依存のクリップで指令を制限します。
+OSC commands are normalized to `[-1, 1]`. Commands are limited by a P gain and distance-dependent clipping.
 
 ---
 
-## 設定（`config/`）
+## Configuration (`config/`)
 
-| ファイル | 対象 | 例 |
+| File | Scope | Examples |
 |---|---|---|
-| `config/env.json` | シーン・sim | 机高さ、球位置/半径/摩擦、箱形状、カメラ、`control_freq=40`、`action_alpha` |
-| `config/perception.json` | 知覚 | HSV 閾値、最小面積 |
-| `config/control.json` | 制御 | `travel_z`、許容誤差、`kp`、保持ステップ |
+| `config/env.json` | Scene / sim | Table height, ball position/radius/friction, box shape, camera, `control_freq=40`, `action_alpha` |
+| `config/perception.json` | Perception | HSV thresholds, minimum area |
+| `config/control.json` | Control | `travel_z`, tolerances, `kp`, hold steps |
 
-`sim.control_freq` と `control_hz` は揃える想定です（既定 40 Hz）。
+`sim.control_freq` and `control_hz` are expected to match (40 Hz by default).
 
 ---
 
-## 起動方法
+## Running the Demo
 
-ターミナル 3 つ（順番どおり）。
+Three terminals, in this order.
 
 ```bash
-# 各ターミナルで環境を有効化してから
-python robosuite_bridge_node.py      # A: シミュレーション
-python hsv_perceptor_node.py         # B: 知覚（デバッグウィンドウあり）
-python task_manager_node.py          # C: 制御
-# 任意: python percept_error_debug_node.py
+# Activate the environment in each terminal first
+python robosuite_bridge_node.py      # A: simulation
+python hsv_perceptor_node.py         # B: perception (with debug window)
+python task_manager_node.py          # C: control
+# Optional: python percept_error_debug_node.py
 ```
 
-正常時、制御側に `Locked 3 balls + box; starting pick sequence` が出て動作開始します。
+When everything works, the control side prints `Locked 3 balls + box; starting pick sequence` and motion begins.
 
 <details>
-<summary><b>環境構築（macOS / Ubuntu）</b></summary>
+<summary><b>Environment setup (macOS / Ubuntu)</b></summary>
 
-### 前提
+### Prerequisites
 
-- macOS arm64（conda + [RoboStack](https://robostack.github.io/)）または Ubuntu 22.04（apt の ROS 2 Humble）
-- 主な依存: `rclpy`, `cv_bridge`, `robosuite==1.4.1`, `mujoco==3.1.2`, OpenCV, NumPy
+- macOS arm64 (conda + [RoboStack](https://robostack.github.io/)) or Ubuntu 22.04 (ROS 2 Humble via apt)
+- Main dependencies: `rclpy`, `cv_bridge`, `robosuite==1.4.1`, `mujoco==3.1.2`, OpenCV, NumPy
 
 ### macOS (Apple Silicon)
 
@@ -191,9 +190,9 @@ pip install "mujoco==3.1.2" pynput termcolor
 pip install --no-deps "robosuite==1.4.1"
 ```
 
-- `--solver=libmamba` / `--override-channels` は RoboStack 解決に必要です  
-- `robosuite==1.4.1` 固定（1.5 系は API 非互換）  
-- macOS では pip の `opencv-python` を入れない（`--no-deps`）こと
+- `--solver=libmamba` / `--override-channels` are required for RoboStack resolution
+- `robosuite==1.4.1` is pinned (the 1.5 series is API-incompatible)
+- On macOS, do not install pip's `opencv-python` (hence `--no-deps`)
 
 ### Ubuntu 22.04
 
@@ -203,7 +202,7 @@ pip install "mujoco==3.1.2" "robosuite==1.4.1" "numpy<2" opencv-python glfw pynp
 source /opt/ros/humble/setup.bash
 ```
 
-### 動作確認
+### Verify the installation
 
 ```bash
 python -c "import rclpy, cv_bridge, robosuite, mujoco, cv2, numpy; print('ok')"
@@ -212,22 +211,22 @@ python -c "import rclpy, cv_bridge, robosuite, mujoco, cv2, numpy; print('ok')"
 </details>
 
 <details>
-<summary><b>トラブルシューティング（要約）</b></summary>
+<summary><b>Troubleshooting (summary)</b></summary>
 
-| 症状 | 確認すること |
+| Symptom | What to check |
 |---|---|
-| `No module named 'rclpy'` | conda / ROS 環境の有効化 |
-| `load_controller_config` 欠落 | `robosuite==1.4.1` に戻す |
-| 球が検出されない | Perception ウィンドウと `perception.json` の HSV / 面積 |
-| 腕が動かない | 3 ノード起動、`/percept/ball_poses` の配信、`Locked 3 balls` ログ |
-| 掴めない | `control.json` の `z_tol` / `grasp_hold_steps`、`env.json` の球半径 |
+| `No module named 'rclpy'` | Whether the conda / ROS environment is activated |
+| `load_controller_config` missing | Revert to `robosuite==1.4.1` |
+| Balls are not detected | The perception window and the HSV / area values in `perception.json` |
+| The arm does not move | All 3 nodes running, `/percept/ball_poses` being published, the `Locked 3 balls` log |
+| Grasping fails | `z_tol` / `grasp_hold_steps` in `control.json`, ball radius in `env.json` |
 
-macOS では MuJoCo の GL をメインスレッド以外に移さないでください（`sim.mujoco_gl` は `glfw` / `cgl`）。
+On macOS, do not move MuJoCo's GL off the main thread (`sim.mujoco_gl` should be `glfw` / `cgl`).
 
 </details>
 
 ---
 
-## 技術スタック
+## Tech Stack
 
 ROS 2 Humble · Python · robosuite 1.4.1 · MuJoCo 3.1.2 · OpenCV · NumPy
