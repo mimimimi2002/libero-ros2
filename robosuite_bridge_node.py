@@ -2,13 +2,12 @@
 """
 Main robosuite bridge node for the tidy-up task.
 
-Scene parameters are loaded from config/env.json.
+Scene / sim parameters are loaded from config/env.json.
 Publishes camera image, camera geometry, EEF pose, and GT object poses (/gt/*).
 Subscribes to /robot/cmd_action and /robot/target_pose.
 """
 import os
 
-# Load GL backend from config before importing MuJoCo / robosuite
 from config_loader import load_env_config
 
 _ENV_CFG = load_env_config()
@@ -45,56 +44,75 @@ class CustomTidyUpEnv(Lift):
 
     def _load_model(self):
         super()._load_model()
-        balls_cfg = self.env_cfg["balls"]
-        box_cfg = self.env_cfg["box"]
+        cfg = self.env_cfg
+        balls_cfg = cfg["balls"]
+        box_cfg = cfg["box"]
 
         self.ball_radius = float(balls_cfg["radius"])
         self.balls = []
+        damping = str(balls_cfg.get("joint_damping", 2.0))
         for i in range(len(balls_cfg["positions_xy"])):
             ball = BallObject(
                 name=f"pingpong_ball_{i}",
                 size=[self.ball_radius],
                 rgba=list(balls_cfg["rgba"]),
-                density=float(balls_cfg["density"]),
+                density=float(balls_cfg.get("density", 400.0)),
+                friction=list(balls_cfg.get("friction", [2.5, 0.2, 0.1])),
+                joints=[{"type": "free", "damping": damping}],
             )
             self.balls.append(ball)
 
         self.box_parts = []
-        self.box_bottom = None
+        rgba = list(box_cfg["rgba"])
         for part in box_cfg["parts"]:
             obj = BoxObject(
                 name=part["name"],
                 size=list(part["size"]),
-                rgba=list(box_cfg["rgba"]),
+                rgba=rgba,
                 joints=[],
             )
-            self.box_parts.append((obj, list(part["offset"])))
+            self.box_parts.append(obj)
             if part["name"] == "box_bottom":
                 self.box_bottom = obj
-            self.model.worldbody.append(obj.get_obj())
-
-        if self.box_bottom is None:
-            raise ValueError("config/env.json box.parts must include 'box_bottom'")
 
         for ball in self.balls:
             self.model.worldbody.append(ball.get_obj())
+        for part in self.box_parts:
+            self.model.worldbody.append(part.get_obj())
+
+    def _bury_lift_cube(self):
+        """Hide Lift's default red cube (invisible, no contact, under floor)."""
+        if not hasattr(self, "cube"):
+            return
+
+        for joint in self.cube.joints:
+            if joint not in self.sim.model.joint_names:
+                continue
+            j_id = self.sim.model.joint_name2id(joint)
+            qpos_addr = self.sim.model.jnt_qposadr[j_id]
+            qvel_addr = self.sim.model.jnt_dofadr[j_id]
+            self.sim.data.qpos[qpos_addr : qpos_addr + 3] = np.array([0.0, 0.0, -1.0])
+            ndof = 6 if self.sim.model.jnt_type[j_id] == 0 else 1
+            self.sim.data.qvel[qvel_addr : qvel_addr + ndof] = 0.0
+
+        body_id = self.sim.model.body_name2id(self.cube.root_body)
+        for i in range(self.sim.model.ngeom):
+            if self.sim.model.geom_bodyid[i] == body_id:
+                self.sim.model.geom_rgba[i, 3] = 0.0
+                self.sim.model.geom_contype[i] = 0
+                self.sim.model.geom_conaffinity[i] = 0
+
+        self.sim.forward()
 
     def _reset_internal(self):
         super()._reset_internal()
-
-        # Hide the default Lift cube
-        if hasattr(self, "cube"):
-            cube_joint = self.cube.joints[0]
-            if cube_joint in self.sim.model.joint_names:
-                j_id = self.sim.model.joint_name2id(cube_joint)
-                qpos_addr = self.sim.model.jnt_qposadr[j_id]
-                self.sim.data.qpos[qpos_addr : qpos_addr + 3] = np.array([0, 0, -10.0])
+        self._bury_lift_cube()
 
         table_z = float(self.env_cfg["table"]["height"])
         z_ball = table_z + self.ball_radius
-        positions_xy = self.env_cfg["balls"]["positions_xy"]
         self.ball_init_poses = [
-            np.array([float(xy[0]), float(xy[1]), z_ball]) for xy in positions_xy
+            np.array([xy[0], xy[1], z_ball], dtype=float)
+            for xy in self.env_cfg["balls"]["positions_xy"]
         ]
         for ball, pos in zip(self.balls, self.ball_init_poses):
             for joint in ball.joints:
@@ -103,10 +121,11 @@ class CustomTidyUpEnv(Lift):
                     qpos_addr = self.sim.model.jnt_qposadr[j_id]
                     self.sim.data.qpos[qpos_addr : qpos_addr + 3] = pos
 
-        center = np.array(self.env_cfg["box"]["center"], dtype=float)
-        for obj, offset in self.box_parts:
-            body_id = self.sim.model.body_name2id(obj.root_body)
-            self.sim.model.body_pos[body_id] = center + np.array(offset, dtype=float)
+        bx, by, bz = self.env_cfg["box"]["center"]
+        for part_cfg, part in zip(self.env_cfg["box"]["parts"], self.box_parts):
+            ox, oy, oz = part_cfg["offset"]
+            body_id = self.sim.model.body_name2id(part.root_body)
+            self.sim.model.body_pos[body_id] = [bx + ox, by + oy, bz + oz]
 
         self.sim.forward()
 
@@ -116,39 +135,46 @@ class RobosuiteBridgeNode(Node):
 
     def __init__(self):
         super().__init__('robosuite_bridge_node')
-        self.env_cfg = _ENV_CFG
-        cam = self.env_cfg["camera"]
-        sim = self.env_cfg["sim"]
+        self.cfg = load_env_config()
+        sim = self.cfg["sim"]
+        cam = self.cfg["camera"]
 
-        self.camera_name = str(cam["name"])
-        self.camera_height = int(cam["height"])
-        self.camera_width = int(cam["width"])
-        self.table_height = float(self.env_cfg["table"]["height"])
+        self.CAMERA_NAME = cam["name"]
+        self.CAMERA_HEIGHT = int(cam["height"])
+        self.CAMERA_WIDTH = int(cam["width"])
+        self.TABLE_HEIGHT = float(self.cfg["table"]["height"])
 
-        self.get_logger().info("Initializing tidy-up scene from config/env.json...")
+        self.get_logger().info("Initializing tidy-up simulation scene...")
 
         controller_config = load_controller_config(
             default_controller=str(sim.get("controller", "OSC_POSE"))
         )
 
+        self.control_freq = float(sim.get("control_freq", 40))
         self.env = CustomTidyUpEnv(
-            self.env_cfg,
+            env_cfg=self.cfg,
             robots=str(sim.get("robot", "Panda")),
             controller_configs=controller_config,
             has_renderer=bool(sim.get("has_renderer", False)),
             has_offscreen_renderer=bool(sim.get("has_offscreen_renderer", True)),
             use_camera_obs=True,
-            camera_names=[self.camera_name],
-            camera_heights=self.camera_height,
-            camera_widths=self.camera_width,
-            control_freq=int(sim.get("control_freq", 20)),
-            horizon=100000,
+            camera_names=[self.CAMERA_NAME],
+            camera_heights=self.CAMERA_HEIGHT,
+            camera_widths=self.CAMERA_WIDTH,
+            control_freq=int(self.control_freq),
+            horizon=int(sim.get("horizon", 100000)),
             ignore_done=True,
         )
 
         self.obs = self.env.reset()
         self.bridge = CvBridge()
-        self.current_action = np.zeros(self.env.action_dim)
+        self.target_action = np.zeros(self.env.action_dim, dtype=np.float64)
+        self.applied_action = np.zeros(self.env.action_dim, dtype=np.float64)
+        self.action_alpha = float(sim.get("action_alpha", 0.35))
+        self._dt = 1.0 / self.control_freq
+        self._next_step_t = time.perf_counter()
+        self._step_count = 0
+        self._display_stride = int(sim.get("display_stride", 2))
 
         self.publisher_image = self.create_publisher(Image, '/camera/image_raw', 10)
         self.publisher_camera_info = self.create_publisher(CameraInfo, '/camera/camera_info', 10)
@@ -171,17 +197,25 @@ class RobosuiteBridgeNode(Node):
 
         cv2.namedWindow("MuJoCo Realtime Simulation", cv2.WINDOW_NORMAL)
         self.get_logger().info(
-            "Bridge ready: image/camera/eef + /gt/* for debug "
-            "(task_manager should use /percept/* only)"
+            f"Bridge ready @ {self.control_freq:.0f} Hz with action ramp "
+            f"(alpha={self.action_alpha})"
         )
 
     def action_callback(self, msg):
-        action = np.array(msg.data, dtype=np.float32)
+        action = np.array(msg.data, dtype=np.float64)
         if len(action) == self.env.action_dim:
-            self.current_action = action
+            self.target_action = action
 
     def target_callback(self, msg):
         self.latest_target = msg
+
+    def _ramped_action(self):
+        """Low-pass filter position deltas; snap gripper immediately."""
+        a = self.action_alpha
+        blended = (1.0 - a) * self.applied_action + a * self.target_action
+        blended[-1] = self.target_action[-1]
+        self.applied_action = blended
+        return self.applied_action.astype(np.float32)
 
     def _log_eef_and_target(self):
         now = time.time()
@@ -210,15 +244,15 @@ class RobosuiteBridgeNode(Node):
 
     def _publish_camera_geometry(self, stamp):
         K = get_camera_intrinsic_matrix(
-            self.env.sim, self.camera_name, self.camera_height, self.camera_width,
+            self.env.sim, self.CAMERA_NAME, self.CAMERA_HEIGHT, self.CAMERA_WIDTH,
         )
-        T_world_cam = get_camera_extrinsic_matrix(self.env.sim, self.camera_name)
+        T_world_cam = get_camera_extrinsic_matrix(self.env.sim, self.CAMERA_NAME)
 
         info = CameraInfo()
         info.header.stamp = stamp
         info.header.frame_id = "agentview_camera_link"
-        info.height = self.camera_height
-        info.width = self.camera_width
+        info.height = self.CAMERA_HEIGHT
+        info.width = self.CAMERA_WIDTH
         info.distortion_model = "plumb_bob"
         info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
         fx, fy = float(K[0, 0]), float(K[1, 1])
@@ -233,18 +267,31 @@ class RobosuiteBridgeNode(Node):
         self.publisher_extrinsic.publish(ext)
 
         table_msg = Float32()
-        table_msg.data = float(self.table_height)
+        table_msg.data = float(self.TABLE_HEIGHT)
         self.publisher_table_height.publish(table_msg)
 
     def run_loop(self):
-        cam_key = f"{self.camera_name}_image"
         while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.0)
+
+            now = time.perf_counter()
+            if now < self._next_step_t:
+                remaining = self._next_step_t - now
+                rclpy.spin_once(self, timeout_sec=min(remaining, 0.005))
+                continue
+
+            self._next_step_t += self._dt
+            if now - self._next_step_t > self._dt:
+                self._next_step_t = now + self._dt
+
             try:
-                self.obs, reward, done, info = self.env.step(self.current_action)
+                action = self._ramped_action()
+                self.obs, reward, done, info = self.env.step(action)
             except ValueError:
                 self.obs = self.env.reset()
                 continue
 
+            self._step_count += 1
             stamp = self.get_clock().now().to_msg()
 
             eef_pos = self.obs['robot0_eef_pos']
@@ -256,42 +303,41 @@ class RobosuiteBridgeNode(Node):
             self.publisher_eef.publish(eef_msg)
             self._log_eef_and_target()
 
-            self._publish_camera_geometry(stamp)
+            if self._step_count % self._display_stride == 0:
+                self._publish_camera_geometry(stamp)
 
-            ball_msg = PoseArray()
-            ball_msg.header.stamp = stamp
-            ball_msg.header.frame_id = "world"
-            for ball in self.env.balls:
-                body_id = self.env.sim.model.body_name2id(ball.root_body)
-                pos = self.env.sim.data.body_xpos[body_id]
-                p = Pose()
-                p.position.x = float(pos[0])
-                p.position.y = float(pos[1])
-                p.position.z = float(pos[2])
-                ball_msg.poses.append(p)
-            self.publisher_gt_balls.publish(ball_msg)
+                ball_msg = PoseArray()
+                ball_msg.header.stamp = stamp
+                ball_msg.header.frame_id = "world"
+                for ball in self.env.balls:
+                    body_id = self.env.sim.model.body_name2id(ball.root_body)
+                    pos = self.env.sim.data.body_xpos[body_id]
+                    p = Pose()
+                    p.position.x = float(pos[0])
+                    p.position.y = float(pos[1])
+                    p.position.z = float(pos[2])
+                    ball_msg.poses.append(p)
+                self.publisher_gt_balls.publish(ball_msg)
 
-            box_bottom_id = self.env.sim.model.body_name2id(self.env.box_bottom.root_body)
-            box_pos = self.env.sim.data.body_xpos[box_bottom_id]
-            box_msg = Pose()
-            box_msg.position.x = float(box_pos[0])
-            box_msg.position.y = float(box_pos[1])
-            box_msg.position.z = float(box_pos[2])
-            self.publisher_gt_box.publish(box_msg)
+                box_bottom_id = self.env.sim.model.body_name2id(self.env.box_bottom.root_body)
+                box_pos = self.env.sim.data.body_xpos[box_bottom_id]
+                box_msg = Pose()
+                box_msg.position.x = float(box_pos[0])
+                box_msg.position.y = float(box_pos[1])
+                box_msg.position.z = float(box_pos[2])
+                self.publisher_gt_box.publish(box_msg)
 
-            raw_image = self.obs[cam_key]
-            bgr_image = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
-            flipped_image = cv2.flip(bgr_image, 0)
+                raw_image = self.obs['agentview_image']
+                bgr_image = cv2.cvtColor(raw_image, cv2.COLOR_RGB2BGR)
+                flipped_image = cv2.flip(bgr_image, 0)
 
-            img_msg = self.bridge.cv2_to_imgmsg(flipped_image, encoding="bgr8")
-            img_msg.header.stamp = stamp
-            img_msg.header.frame_id = "agentview_camera_link"
-            self.publisher_image.publish(img_msg)
+                img_msg = self.bridge.cv2_to_imgmsg(flipped_image, encoding="bgr8")
+                img_msg.header.stamp = stamp
+                img_msg.header.frame_id = "agentview_camera_link"
+                self.publisher_image.publish(img_msg)
 
-            cv2.imshow("MuJoCo Realtime Simulation", flipped_image)
-            cv2.waitKey(1)
-
-            rclpy.spin_once(self, timeout_sec=0.001)
+                cv2.imshow("MuJoCo Realtime Simulation", flipped_image)
+                cv2.waitKey(1)
 
     def destroy_node(self):
         cv2.destroyAllWindows()
