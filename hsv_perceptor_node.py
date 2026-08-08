@@ -2,9 +2,7 @@
 """
 HSV-based vision perceptor.
 
-Detects balls/box in the RGB image and lifts 2D detections to 3D via
-ray–table-plane intersection. Geometry comes from config/env.json;
-HSV thresholds from config/perception.json.
+Parameters from config/perception.json and ball radius from config/env.json.
 """
 import rclpy
 from rclpy.node import Node
@@ -21,12 +19,11 @@ from config_loader import load_env_config, load_perception_config
 class HsvPerceptorNode(Node):
     def __init__(self):
         super().__init__('hsv_perceptor_node')
-
         env_cfg = load_env_config()
         perc_cfg = load_perception_config()
 
-        self.ball_radius = float(env_cfg["balls"]["radius"])
-        self.box_center_offset_z = float(perc_cfg["box_center_offset_z"])
+        self.BALL_RADIUS = float(env_cfg["balls"]["radius"])
+        self.BOX_CENTER_OFFSET_Z = float(perc_cfg.get("box_center_offset_z", 0.02))
         self.ball_min_area = float(perc_cfg["detection"]["ball_min_area"])
         self.box_min_area = float(perc_cfg["detection"]["box_min_area"])
 
@@ -36,9 +33,7 @@ class HsvPerceptorNode(Node):
         self.box_hsv_low = np.array(hsv["box_low"], dtype=np.int32)
         self.box_hsv_high = np.array(hsv["box_high"], dtype=np.int32)
 
-        self.get_logger().info(
-            f"HSV perceptor ready (ball_radius={self.ball_radius} from config/env.json)"
-        )
+        self.get_logger().info("HSV perceptor started (HSV + table-plane lift)...")
 
         self.bridge = CvBridge()
         self.K = None
@@ -47,7 +42,9 @@ class HsvPerceptorNode(Node):
 
         self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
         self.create_subscription(CameraInfo, '/camera/camera_info', self.info_callback, 10)
-        self.create_subscription(Float64MultiArray, '/camera/extrinsic', self.extrinsic_callback, 10)
+        self.create_subscription(
+            Float64MultiArray, '/camera/extrinsic', self.extrinsic_callback, 10
+        )
         self.create_subscription(Float32, '/world/table_height', self.table_callback, 10)
 
         self.pub_balls = self.create_publisher(PoseArray, '/percept/ball_poses', 10)
@@ -93,11 +90,13 @@ class HsvPerceptorNode(Node):
         cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         hsv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2HSV)
 
-        ball_plane_z = self.table_height + self.ball_radius
-        box_plane_z = self.table_height + self.box_center_offset_z
+        ball_plane_z = self.table_height + self.BALL_RADIUS
+        box_plane_z = self.table_height + self.BOX_CENTER_OFFSET_Z
 
         ball_mask = cv2.inRange(hsv_img, self.ball_hsv_low, self.ball_hsv_high)
-        contours, _ = cv2.findContours(ball_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            ball_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
         ball_poses = PoseArray()
         ball_poses.header = msg.header
@@ -134,7 +133,9 @@ class HsvPerceptorNode(Node):
         self.pub_balls.publish(ball_poses)
 
         box_mask = cv2.inRange(hsv_img, self.box_hsv_low, self.box_hsv_high)
-        box_contours, _ = cv2.findContours(box_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        box_contours, _ = cv2.findContours(
+            box_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
         if len(box_contours) > 0:
             largest_box = max(box_contours, key=cv2.contourArea)

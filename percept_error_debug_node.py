@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Debug node: compare vision estimates (/percept/*) against simulator GT (/gt/*).
+Debug node: compare perception estimates (/percept/*) against sim GT (/gt/*).
 
 Subscribes:
   /percept/ball_poses, /percept/box_pose
   /gt/ball_poses, /gt/box_pose
 
 Publishes:
-  /debug/ball_pose_errors   PoseArray  position=(ex,ey,ez)=est-gt [m]
+  /debug/ball_pose_errors   PoseArray  position=(ex,ey,ez)= est - gt [m]
   /debug/box_pose_error     Pose       position=(ex,ey,ez)
   /debug/ball_error_stats   Float32MultiArray
       [n_matched, mean_xy, mean_3d, max_xy, max_3d]  (meters)
@@ -20,13 +20,17 @@ from geometry_msgs.msg import PoseArray, Pose
 from std_msgs.msg import Float32MultiArray
 import numpy as np
 
+from config_loader import load_perception_config
+
 
 class PerceptErrorDebugNode(Node):
-    MATCH_THRESH_XY = 0.12  # [m] reject matches farther than this in XY
-
     def __init__(self):
         super().__init__('percept_error_debug_node')
-        self.get_logger().info("Perception error debug node (/percept vs /gt)...")
+        perc_cfg = load_perception_config()
+        self.MATCH_THRESH_XY = float(
+            perc_cfg.get("debug", {}).get("match_thresh_xy", 0.12)
+        )
+        self.get_logger().info("Percept error debug started (/percept vs /gt)...")
 
         self.est_balls = []
         self.gt_balls = []
@@ -43,8 +47,8 @@ class PerceptErrorDebugNode(Node):
         self.pub_ball_stats = self.create_publisher(Float32MultiArray, '/debug/ball_error_stats', 10)
         self.pub_box_stats = self.create_publisher(Float32MultiArray, '/debug/box_error_stats', 10)
 
-        self.create_timer(0.05, self.compare_loop)  # 20 Hz
-        self.create_timer(1.0, self.log_summary)    # 1 Hz
+        self.create_timer(0.05, self.compare_loop)  # 20 Hz compare
+        self.create_timer(1.0, self.log_summary)    # 1 Hz log
 
         self._last_ball_stats = None
         self._last_box_stats = None
@@ -87,7 +91,7 @@ class PerceptErrorDebugNode(Node):
         return pairs
 
     def compare_loop(self):
-        # Balls
+        # ---- balls ----
         if self.gt_balls and self.est_balls:
             pairs = self._match_pairs(self.gt_balls, self.est_balls)
             err_msg = PoseArray()
@@ -122,7 +126,7 @@ class PerceptErrorDebugNode(Node):
             else:
                 self._last_ball_stats = None
 
-        # Box
+        # ---- box ----
         if self.gt_box is not None and self.est_box is not None:
             g = self._xyz(self.gt_box)
             e = self._xyz(self.est_box)
