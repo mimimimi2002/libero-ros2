@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Task manager for pick-and-place tidy-up.
+Task manager for the tidy-up pick-and-place sequence.
 
-Control gains and clearances are loaded from config/control.json.
+Parameters from config/control.json.
+Motion is strictly axis-separated (XY-only and Z-only phases).
 """
 import rclpy
 from rclpy.node import Node
@@ -18,24 +19,25 @@ class TaskManagerNode(Node):
         super().__init__('task_manager_node')
         cfg = load_control_config()
 
-        self.tcp_offset_x = float(cfg["tcp_offset_xy"][0])
-        self.tcp_offset_y = float(cfg["tcp_offset_xy"][1])
-        self.place_z = float(cfg["place_z"])
-        self.hover_clearance = float(cfg["hover_clearance"])
-        self.lift_clearance = float(cfg["lift_clearance"])
-        self.xy_tol = float(cfg["xy_tol"])
-        self.z_tol = float(cfg["z_tol"])
-        self.place_xy_tol = float(cfg["place_xy_tol"])
-        self.stable_need = int(cfg["stable_need"])
-        self.kp = float(cfg["kp"])
-        self.v_max_far = float(cfg["v_max_far"])
-        self.v_max_near = float(cfg["v_max_near"])
-        self.near_dist = float(cfg["near_dist"])
-        self.grasp_hold_steps = int(cfg["grasp_hold_steps"])
-        self.release_hold_steps = int(cfg["release_hold_steps"])
-        control_period = float(cfg["control_period"])
+        tcp = cfg.get("tcp_offset_xy", [0.0, 0.0])
+        self.TCP_OFFSET_X = float(tcp[0])
+        self.TCP_OFFSET_Y = float(tcp[1])
+        self.TRAVEL_Z = float(cfg.get("travel_z", 1.05))
+        self.CONTROL_HZ = float(cfg.get("control_hz", 40.0))
+        self.XY_TOL = float(cfg.get("xy_tol", 0.012))
+        self.Z_TOL = float(cfg.get("z_tol", 0.012))
+        self.PLACE_XY_TOL = float(cfg.get("place_xy_tol", 0.020))
+        self.STABLE_NEED = int(cfg.get("stable_need", 8))
+        self.Kp = float(cfg.get("kp", 12.0))
+        self.CMD_MAX_FAR = float(cfg.get("cmd_max_far", 0.40))
+        self.CMD_MAX_NEAR = float(cfg.get("cmd_max_near", 0.18))
+        self.NEAR_DIST = float(cfg.get("near_dist", 0.06))
+        self.GRASP_HOLD_STEPS = int(cfg.get("grasp_hold_steps", 60))
+        self.RELEASE_HOLD_STEPS = int(cfg.get("release_hold_steps", 40))
 
-        self.get_logger().info("Task manager ready (config/control.json)")
+        self.get_logger().info(
+            f"Task manager @ {self.CONTROL_HZ:.0f} Hz (axis-separated XY / Z)"
+        )
 
         self.create_subscription(PoseArray, '/percept/ball_poses', self.balls_callback, 10)
         self.create_subscription(Pose, '/percept/box_pose', self.box_callback, 10)
@@ -49,13 +51,14 @@ class TaskManagerNode(Node):
 
         self.state = "INIT"
         self.target_ball_idx = 0
-        # 0 hover / 1 descend / 2 grasp / 3 lift / 4 to box / 5 release
+        # 0 Z-up / 1 XY-to-ball / 2 Z-down / 3 grasp
+        # 4 Z-lift / 5 XY-to-box / 6 release
         self.sub_step = 0
         self.step_counter = 0
         self.stable_count = 0
-        self.gripper = -1.0  # -1 open, +1 close
+        self.gripper = -1.0
 
-        self.create_timer(control_period, self.control_loop)
+        self.create_timer(1.0 / self.CONTROL_HZ, self.control_loop)
 
     def balls_callback(self, msg):
         if self.state == "INIT" and len(msg.poses) > 0:
@@ -80,29 +83,41 @@ class TaskManagerNode(Node):
         msg.position.z = float(z)
         self.pub_target.publish(msg)
 
-    def _vmax(self, dist):
-        if dist > self.near_dist:
-            return self.v_max_far
-        alpha = dist / self.near_dist
-        return self.v_max_near + alpha * (self.v_max_far - self.v_max_near)
+    def _cmd_max(self, dist):
+        if dist > self.NEAR_DIST:
+            return self.CMD_MAX_FAR
+        alpha = dist / self.NEAR_DIST
+        return self.CMD_MAX_NEAR + alpha * (self.CMD_MAX_FAR - self.CMD_MAX_NEAR)
 
-    def _smooth_cmd(self, target, current):
-        err = np.asarray(target, dtype=np.float64) - np.asarray(current, dtype=np.float64)
+    def _axis_cmd(self, err_vec):
+        """Scale a 3-vector error (m) to OSC cmd in [-1, 1]."""
+        err = np.asarray(err_vec, dtype=np.float64)
         dist = float(np.linalg.norm(err))
-        if dist < 1e-6:
-            return 0.0, 0.0, 0.0, dist
-        raw = err * self.kp
-        lim = self._vmax(dist)
-        scale = min(1.0, lim / (np.linalg.norm(raw) + 1e-9))
-        cmd = raw * scale
-        return float(cmd[0]), float(cmd[1]), float(cmd[2]), dist
+        if dist < 1e-9:
+            return np.zeros(3), 0.0
+        raw = err * self.Kp
+        lim = self._cmd_max(dist)
+        n = float(np.linalg.norm(raw))
+        if n > lim:
+            raw = raw * (lim / n)
+        return np.clip(raw, -1.0, 1.0), dist
+
+    def _cmd_xy_only(self, target_xy, cur):
+        err = np.array([target_xy[0] - cur[0], target_xy[1] - cur[1], 0.0])
+        cmd, dist = self._axis_cmd(err)
+        return float(cmd[0]), float(cmd[1]), 0.0, dist
+
+    def _cmd_z_only(self, target_z, cur):
+        err = np.array([0.0, 0.0, target_z - cur[2]])
+        cmd, dist = self._axis_cmd(err)
+        return 0.0, 0.0, float(cmd[2]), dist
 
     def _advance_if_stable(self, ok):
         if ok:
             self.stable_count += 1
         else:
             self.stable_count = 0
-        if self.stable_count >= self.stable_need:
+        if self.stable_count >= self.STABLE_NEED:
             self.stable_count = 0
             return True
         return False
@@ -127,7 +142,7 @@ class TaskManagerNode(Node):
             return
 
         if self.target_ball_idx >= len(self.balls):
-            self.get_logger().info("All balls placed")
+            self.get_logger().info("All balls placed; finished")
             self.state = "FINISHED"
             return
 
@@ -139,98 +154,94 @@ class TaskManagerNode(Node):
             self.eef_pose.position.y,
             self.eef_pose.position.z,
         ])
-        ball_c = np.array([
-            ball.position.x + self.tcp_offset_x,
-            ball.position.y + self.tcp_offset_y,
-            ball.position.z,
+        ball_xy = np.array([
+            ball.position.x + self.TCP_OFFSET_X,
+            ball.position.y + self.TCP_OFFSET_Y,
         ])
+        ball_z = float(ball.position.z)
+        travel_z = self.TRAVEL_Z
+        box_xy = np.array([self.box_pose.position.x, self.box_pose.position.y])
 
         if self.sub_step == 0:
             self.gripper = -1.0
-            target = np.array([ball_c[0], ball_c[1], ball_c[2] + self.hover_clearance])
-            self.publish_target(*target)
-            dx, dy, dz, _ = self._smooth_cmd(target, cur)
+            self.publish_target(cur[0], cur[1], travel_z)
+            dx, dy, dz, _ = self._cmd_z_only(travel_z, cur)
             self.send_action(dx, dy, dz)
-
-            ok = (
-                abs(target[0] - cur[0]) < self.xy_tol
-                and abs(target[1] - cur[1]) < self.xy_tol
-                and abs(target[2] - cur[2]) < self.z_tol
-            )
-            if self._advance_if_stable(ok):
+            if self._advance_if_stable(abs(travel_z - cur[2]) < self.Z_TOL):
                 self.get_logger().info(
-                    f"Ball {self.target_ball_idx + 1}: hover reached -> descend"
+                    f"ball{self.target_ball_idx+1}: Z travel -> XY to ball"
                 )
                 self.sub_step = 1
                 self.step_counter = 0
 
         elif self.sub_step == 1:
             self.gripper = -1.0
-            target = ball_c.copy()
-            self.publish_target(*target)
-            _, _, dz, _ = self._smooth_cmd(
-                np.array([cur[0], cur[1], target[2]]), cur
-            )
-            self.send_action(0.0, 0.0, dz)
-
-            at_target_z = abs(target[2] - cur[2]) < self.z_tol
-            if self._advance_if_stable(at_target_z):
+            self.publish_target(ball_xy[0], ball_xy[1], travel_z)
+            dx, dy, dz, _ = self._cmd_xy_only(ball_xy, cur)
+            self.send_action(dx, dy, dz)
+            ok = (abs(ball_xy[0] - cur[0]) < self.XY_TOL
+                  and abs(ball_xy[1] - cur[1]) < self.XY_TOL)
+            if self._advance_if_stable(ok):
                 self.get_logger().info(
-                    f"Ball {self.target_ball_idx + 1}: target z reached "
-                    f"(z={cur[2]:.3f}, target_z={target[2]:.3f}) -> grasp"
+                    f"ball{self.target_ball_idx+1}: XY above ball -> Z descend"
                 )
                 self.sub_step = 2
                 self.step_counter = 0
 
         elif self.sub_step == 2:
-            self.publish_target(*ball_c)
+            self.gripper = -1.0
+            self.publish_target(ball_xy[0], ball_xy[1], ball_z)
+            dx, dy, dz, _ = self._cmd_z_only(ball_z, cur)
+            self.send_action(dx, dy, dz)
+            if self._advance_if_stable(abs(ball_z - cur[2]) < self.Z_TOL):
+                self.get_logger().info(
+                    f"ball{self.target_ball_idx+1}: Z at ball -> grasp"
+                )
+                self.sub_step = 3
+                self.step_counter = 0
+
+        elif self.sub_step == 3:
+            hold = np.array([ball_xy[0], ball_xy[1], ball_z])
+            self.publish_target(*hold)
             self.gripper = 1.0
             self.send_action(0.0, 0.0, 0.0)
-            if self.step_counter > self.grasp_hold_steps:
-                self.sub_step = 3
+            if self.step_counter > self.GRASP_HOLD_STEPS:
+                self.sub_step = 4
                 self.step_counter = 0
                 self.stable_count = 0
 
-        elif self.sub_step == 3:
-            self.gripper = 1.0
-            target = np.array([ball_c[0], ball_c[1], ball_c[2] + self.lift_clearance])
-            self.publish_target(*target)
-            _, _, dz, _ = self._smooth_cmd(
-                np.array([cur[0], cur[1], target[2]]), cur
-            )
-            self.send_action(0.0, 0.0, dz)
-
-            ok = abs(target[2] - cur[2]) < 0.025
-            if self._advance_if_stable(ok):
-                self.sub_step = 4
-                self.step_counter = 0
-
         elif self.sub_step == 4:
             self.gripper = 1.0
-            target = np.array([
-                self.box_pose.position.x,
-                self.box_pose.position.y,
-                self.place_z,
-            ])
-            self.publish_target(*target)
-            dx, dy, dz, _ = self._smooth_cmd(target, cur)
+            self.publish_target(cur[0], cur[1], travel_z)
+            dx, dy, dz, _ = self._cmd_z_only(travel_z, cur)
             self.send_action(dx, dy, dz)
-
-            ok = (
-                abs(target[0] - cur[0]) < self.place_xy_tol
-                and abs(target[1] - cur[1]) < self.place_xy_tol
-            )
-            if self._advance_if_stable(ok):
+            if self._advance_if_stable(abs(travel_z - cur[2]) < self.Z_TOL):
+                self.get_logger().info(
+                    f"ball{self.target_ball_idx+1}: Z travel -> XY to box"
+                )
                 self.sub_step = 5
                 self.step_counter = 0
 
         elif self.sub_step == 5:
-            self.publish_target(
-                self.box_pose.position.x, self.box_pose.position.y, self.place_z
-            )
+            self.gripper = 1.0
+            self.publish_target(box_xy[0], box_xy[1], travel_z)
+            dx, dy, dz, _ = self._cmd_xy_only(box_xy, cur)
+            self.send_action(dx, dy, dz)
+            ok = (abs(box_xy[0] - cur[0]) < self.PLACE_XY_TOL
+                  and abs(box_xy[1] - cur[1]) < self.PLACE_XY_TOL)
+            if self._advance_if_stable(ok):
+                self.get_logger().info(
+                    f"ball{self.target_ball_idx+1}: XY above box -> release"
+                )
+                self.sub_step = 6
+                self.step_counter = 0
+
+        elif self.sub_step == 6:
+            hold = np.array([box_xy[0], box_xy[1], travel_z])
+            self.publish_target(*hold)
             self.gripper = -1.0
             self.send_action(0.0, 0.0, 0.0)
-            if self.step_counter > self.release_hold_steps:
+            if self.step_counter > self.RELEASE_HOLD_STEPS:
                 self.get_logger().info(f"Placed ball {self.target_ball_idx + 1}")
                 self.target_ball_idx += 1
                 self.sub_step = 0
